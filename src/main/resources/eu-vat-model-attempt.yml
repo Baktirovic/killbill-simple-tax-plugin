@@ -656,6 +656,10 @@ tax_bundles:
     - id: fi_vat_standard_2013
       rate: "0.240"
       starting_on: "2013-01-01"
+      stopping_on: "2024-09-01"
+    - id: fi_vat_standard_2024
+      rate: "0.255"
+      starting_on: "2024-09-01"     
   - id: fi_vat_intermediate
     name: Intermediate
     rates:
