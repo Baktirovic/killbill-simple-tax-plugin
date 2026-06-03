@@ -265,71 +265,102 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
             }
 
         } else if (INVOICE_ADJUSTMENT.equals(event.getEventType())) {
-            logger.info("Computing tax adjustments for invoice [" + invoiceId
-                    + "] after item adjustment for tenant [" + tenantId + "]");
-
-            Invoice invoice;
+            logger.info("INVOICE_ADJUSTMENT received for invoice [" + invoiceId + "] tenant [" + tenantId + "]");
             try {
-                invoice = getInvoiceUserApi().getInvoice(invoiceId, new PluginTenantContext(null, tenantId));
-            } catch (OSGIServiceNotAvailable exc) {
-                logger.error("before tax-adjusting invoice [" + invoiceId
-                        + "]: invoice user API is not available", exc);
-                throw exc;
-            } catch (InvoiceApiException exc) {
-                logger.error("before tax-adjusting invoice [" + invoiceId
-                        + "]: invoice cannot be fetched", exc);
-                return;
+                applyTaxAdjustmentsForItemAdj(invoiceId, tenantId);
+            } catch (Exception exc) {
+                logger.error("Unexpected error in tax adjustment handler for invoice [" + invoiceId + "]", exc);
             }
+        }
+    }
 
-            InvoiceContext invCtx = new InvoiceContextImp.Builder<>()
-                    .withAccountId(invoice.getAccountId())
-                    .withTenantId(tenantId)
-                    .withCreatedDate(DateTime.now())
-                    .withInvoice(invoice)
-                    .build();
+    private void applyTaxAdjustmentsForItemAdj(UUID invoiceId, UUID tenantId) throws Exception {
+        Invoice invoice;
+        try {
+            invoice = getInvoiceUserApi().getInvoice(invoiceId, new PluginTenantContext(null, tenantId));
+        } catch (OSGIServiceNotAvailable exc) {
+            logger.error("applyTaxAdjustmentsForItemAdj: invoice user API unavailable for invoice [" + invoiceId + "]", exc);
+            throw exc;
+        } catch (InvoiceApiException exc) {
+            logger.error("applyTaxAdjustmentsForItemAdj: cannot fetch invoice [" + invoiceId + "]", exc);
+            return;
+        }
 
-            TaxComputationContext taxCtx = createTaxComputationContext(invoice, invCtx);
-            TaxResolver taxResolver = instanciateTaxResolver(taxCtx);
-            Map<UUID, TaxCode> newTaxCodes = addMissingTaxCodes(invoice, taxResolver, taxCtx, invCtx);
+        boolean hasItemAdj = false;
+        for (InvoiceItem item : invoice.getInvoiceItems()) {
+            if (InvoiceItemType.ITEM_ADJ.equals(item.getInvoiceItemType())) {
+                hasItemAdj = true;
+                break;
+            }
+        }
+        if (!hasItemAdj) {
+            logger.debug("applyTaxAdjustmentsForItemAdj: no ITEM_ADJ on invoice [" + invoiceId + "], skipping");
+            return;
+        }
 
-            // Compute any TAX adjustments needed due to ITEM_ADJ on taxable rows.
-            // computeTaxOrAdjustmentItemsForNewInvoice is idempotent: if getAdditionalInvoiceItems
-            // already applied a TAX adjustment during the Kill Bill adjustInvoiceItem call,
-            // currentTaxAmount will already match expectedTaxAmount and this list will be empty.
-            List<InvoiceItem> taxAdjustments = computeTaxOrAdjustmentItemsForNewInvoice(invoice, taxCtx, newTaxCodes);
+        InvoiceContext invCtx = new InvoiceContextImp.Builder<>()
+                .withAccountId(invoice.getAccountId())
+                .withTenantId(tenantId)
+                .withCreatedDate(DateTime.now())
+                .withInvoice(invoice)
+                .build();
 
-            if (!taxAdjustments.isEmpty()) {
-                killbillAPI.getSecurityApi().login("admin", "password");
-                try {
-                    for (InvoiceItem adj : taxAdjustments) {
-                        if (adj == null || adj.getAmount() == null) {
-                            continue;
-                        }
-                        logger.info("Applying TAX adjustment of [" + adj.getAmount()
-                                + "] linked to item [" + adj.getLinkedItemId()
-                                + "] on invoice [" + invoiceId + "]");
-                        if (isTaxItem(adj)) {
-                            getInvoiceUserApi().insertTaxItems(
-                                    invoice.getAccountId(), invoice.getInvoiceDate(),
-                                    newArrayList(adj), false, ImmutableList.of(), invCtx);
-                        } else if (adj.getAmount().compareTo(ZERO) < 0) {
-                            // Negative ITEM_ADJ = TAX reduction; insertInvoiceItemAdjustment takes positive reduction amount
-                            getInvoiceUserApi().insertInvoiceItemAdjustment(
-                                    invoice.getAccountId(), invoice.getId(), adj.getLinkedItemId(),
-                                    invoice.getInvoiceDate(), adj.getAmount().negate(),
-                                    invoice.getCurrency(), adj.getDescription(), null,
-                                    ImmutableList.of(), invCtx);
-                        } else {
-                            logger.warn("Skipping unsupported positive TAX adjustment of [" + adj.getAmount()
-                                    + "] for invoice [" + invoiceId + "] — cannot increase a committed TAX item");
-                        }
-                    }
-                } catch (Exception exc) {
-                    logger.error("Failed to apply TAX adjustments for invoice [" + invoiceId + "]", exc);
-                } finally {
-                    killbillAPI.getSecurityApi().logout();
+        logger.info("applyTaxAdjustmentsForItemAdj: building tax context for invoice [" + invoiceId
+                + "] account [" + invoice.getAccountId() + "]");
+        TaxComputationContext taxCtx = createTaxComputationContext(invoice, invCtx);
+        TaxResolver taxResolver = instanciateTaxResolver(taxCtx);
+        Map<UUID, TaxCode> newTaxCodes = addMissingTaxCodes(invoice, taxResolver, taxCtx, invCtx);
+
+        List<InvoiceItem> taxAdjustments = computeTaxOrAdjustmentItemsForNewInvoice(invoice, taxCtx, newTaxCodes);
+        logger.info("applyTaxAdjustmentsForItemAdj: computed [" + taxAdjustments.size()
+                + "] adjustment(s) for invoice [" + invoiceId + "]");
+
+        if (taxAdjustments.isEmpty()) {
+            return;
+        }
+
+        SimpleTaxConfig cfg = taxCtx.getConfig();
+        killbillAPI.getSecurityApi().login(
+                cfg.getCredentials().get("username"),
+                cfg.getCredentials().get("password"));
+        try {
+            for (InvoiceItem adj : taxAdjustments) {
+                if (adj == null || adj.getAmount() == null) {
+                    continue;
+                }
+                logger.info("applyTaxAdjustmentsForItemAdj: applying adjustment amount=[" + adj.getAmount()
+                        + "] type=[" + adj.getInvoiceItemType()
+                        + "] linkedItem=[" + adj.getLinkedItemId()
+                        + "] on invoice [" + invoiceId + "]");
+                if (isTaxItem(adj)) {
+                    getInvoiceUserApi().insertTaxItems(
+                            invoice.getAccountId(),
+                            invoice.getInvoiceDate(),
+                            newArrayList(adj),
+                            false,
+                            ImmutableList.<PluginProperty>of(),
+                            invCtx);
+                } else if (adj.getAmount().compareTo(ZERO) < 0) {
+                    getInvoiceUserApi().insertInvoiceItemAdjustment(
+                            invoice.getAccountId(),
+                            invoice.getId(),
+                            adj.getLinkedItemId(),
+                            invoice.getInvoiceDate(),
+                            adj.getAmount().negate(),
+                            invoice.getCurrency(),
+                            adj.getDescription(),
+                            null,
+                            ImmutableList.<PluginProperty>of(),
+                            invCtx);
+                } else {
+                    logger.warn("applyTaxAdjustmentsForItemAdj: skipping positive adj amount=[" + adj.getAmount()
+                            + "] on invoice [" + invoiceId + "]");
                 }
             }
+        } catch (Exception exc) {
+            logger.error("applyTaxAdjustmentsForItemAdj: failed to apply adjustments for invoice [" + invoiceId + "]", exc);
+        } finally {
+            killbillAPI.getSecurityApi().logout();
         }
     }
 
