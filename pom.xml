@@ -25,7 +25,7 @@
 
     <groupId>org.kill-bill.billing.plugin.java</groupId>
     <artifactId>simple-tax-plugin</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <packaging>bundle</packaging>
 
     <name>Kill Bill simple tax plugin</name>

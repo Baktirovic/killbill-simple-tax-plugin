@@ -134,7 +134,7 @@ public class SimpleTaxConfig {
      */
     public static final String DEFAULT_TAX_ITEM_DESC = "tax";
     private static final DateTimeZone DEFAULT_TAXATION_TIME_ZONE = null;
-    private static final int DEFAULT_TAX_AMOUNT_PRECISION = 2;
+    private static final int DEFAULT_TAX_AMOUNT_PRECISION = 0;
     private static final BigDecimal DEFAULT_TAX_RATE = new BigDecimal("0.00");
     private static final Class<? extends TaxResolver> DEFAULT_RESOLVER = NullTaxResolver.class;
     private static final Constructor<? extends TaxResolver> DEFAULT_RESOLVER_CONSTRUCTOR;

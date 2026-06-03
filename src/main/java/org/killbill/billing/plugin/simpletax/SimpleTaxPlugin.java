@@ -85,9 +85,10 @@ import static com.google.common.collect.Lists.newArrayList;
 import static com.google.common.collect.Maps.newHashMap;
 import static com.google.common.collect.Ordering.natural;
 import static java.math.BigDecimal.ZERO;
-import static java.math.RoundingMode.HALF_UP;
+import static java.math.RoundingMode.CEILING;
 import static org.killbill.billing.ObjectType.INVOICE;
 import static org.killbill.billing.ObjectType.INVOICE_ITEM;
+import static org.killbill.billing.notification.plugin.api.ExtBusEventType.INVOICE_ADJUSTMENT;
 import static org.killbill.billing.notification.plugin.api.ExtBusEventType.INVOICE_CREATION;
 import static org.killbill.billing.plugin.api.invoice.PluginInvoiceItem.createAdjustmentItem;
 import static org.killbill.billing.plugin.api.invoice.PluginInvoiceItem.createTaxItem;
@@ -221,46 +222,114 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
                 + "] of type [" + event.getObjectType() + "] belonging to account [" + event.getAccountId()
                 + "] in tenant [" + event.getTenantId() + "]");
 
-        if (!INVOICE_CREATION.equals(event.getEventType())) {
-            return;
-        }
         if (!INVOICE.equals(event.getObjectType())) {
             return;
         }
+
         UUID invoiceId = event.getObjectId();
         UUID tenantId = event.getTenantId();
-        logger.info("Adding tax codes to invoice [" + invoiceId
-                + "] as post-creation treatment for tenant [" + tenantId + "]");
 
-        Invoice newInvoice;
-        try {
-            newInvoice = getInvoiceUserApi().getInvoice(invoiceId, new PluginTenantContext(null, tenantId));
-        } catch (OSGIServiceNotAvailable exc) {
-            logger.error("before post-treating taxes on invoice [" + invoiceId
-                    + "]: invoice user API is not available", exc);
-            throw exc;
-        } catch (InvoiceApiException exc) {
-            logger.error("before post-treating taxes on invoice [" + invoiceId
-                    + "]: invoice cannot be fetched", exc);
-            throw new RuntimeException("unexpected error before post-treating taxes on invoice [" + invoiceId + "]",
-                    exc);
-        }
+        if (INVOICE_CREATION.equals(event.getEventType())) {
+            logger.info("Adding tax codes to invoice [" + invoiceId
+                    + "] as post-creation treatment for tenant [" + tenantId + "]");
 
-        InvoiceContext invCtx = new InvoiceContextImp.Builder<>().withAccountId(null).withTenantId(tenantId).withCreatedDate(DateTime.now()).withInvoice(newInvoice).build();
+            Invoice newInvoice;
+            try {
+                newInvoice = getInvoiceUserApi().getInvoice(invoiceId, new PluginTenantContext(null, tenantId));
+            } catch (OSGIServiceNotAvailable exc) {
+                logger.error("before post-treating taxes on invoice [" + invoiceId
+                        + "]: invoice user API is not available", exc);
+                throw exc;
+            } catch (InvoiceApiException exc) {
+                logger.error("before post-treating taxes on invoice [" + invoiceId
+                        + "]: invoice cannot be fetched", exc);
+                throw new RuntimeException("unexpected error before post-treating taxes on invoice [" + invoiceId + "]",
+                        exc);
+            }
 
-        TaxComputationContext taxCtx = createTaxComputationContext(newInvoice, invCtx);
-        TaxResolver taxResolver = instanciateTaxResolver(taxCtx);
-        Map<UUID, TaxCode> newTaxCodes = addMissingTaxCodes(newInvoice, taxResolver, taxCtx, invCtx);
+            InvoiceContext invCtx = new InvoiceContextImp.Builder<>().withAccountId(null).withTenantId(tenantId).withCreatedDate(DateTime.now()).withInvoice(newInvoice).build();
 
-        // Since we're coming from the bus, we need to log-in manually
-        // TODO The plugin should have its own table instead of relying on custom fields for this
-        killbillAPI.getSecurityApi().login("admin", "password");
+            TaxComputationContext taxCtx = createTaxComputationContext(newInvoice, invCtx);
+            TaxResolver taxResolver = instanciateTaxResolver(taxCtx);
+            Map<UUID, TaxCode> newTaxCodes = addMissingTaxCodes(newInvoice, taxResolver, taxCtx, invCtx);
 
-        for (Entry<UUID, TaxCode> entry : newTaxCodes.entrySet()) {
-            UUID invoiceItemId = entry.getKey();
-            TaxCode taxCode = entry.getValue();
-            // Need to do it by listening to the event since we cannot add custom fields until the invoice is created
-            persistTaxCode(taxCode, invoiceItemId, newInvoice, invCtx);
+            // Since we're coming from the bus, we need to log-in manually
+            // TODO The plugin should have its own table instead of relying on custom fields for this
+            killbillAPI.getSecurityApi().login("admin", "password");
+
+            for (Entry<UUID, TaxCode> entry : newTaxCodes.entrySet()) {
+                UUID invoiceItemId = entry.getKey();
+                TaxCode taxCode = entry.getValue();
+                // Need to do it by listening to the event since we cannot add custom fields until the invoice is created
+                persistTaxCode(taxCode, invoiceItemId, newInvoice, invCtx);
+            }
+
+        } else if (INVOICE_ADJUSTMENT.equals(event.getEventType())) {
+            logger.info("Computing tax adjustments for invoice [" + invoiceId
+                    + "] after item adjustment for tenant [" + tenantId + "]");
+
+            Invoice invoice;
+            try {
+                invoice = getInvoiceUserApi().getInvoice(invoiceId, new PluginTenantContext(null, tenantId));
+            } catch (OSGIServiceNotAvailable exc) {
+                logger.error("before tax-adjusting invoice [" + invoiceId
+                        + "]: invoice user API is not available", exc);
+                throw exc;
+            } catch (InvoiceApiException exc) {
+                logger.error("before tax-adjusting invoice [" + invoiceId
+                        + "]: invoice cannot be fetched", exc);
+                return;
+            }
+
+            InvoiceContext invCtx = new InvoiceContextImp.Builder<>()
+                    .withAccountId(invoice.getAccountId())
+                    .withTenantId(tenantId)
+                    .withCreatedDate(DateTime.now())
+                    .withInvoice(invoice)
+                    .build();
+
+            TaxComputationContext taxCtx = createTaxComputationContext(invoice, invCtx);
+            TaxResolver taxResolver = instanciateTaxResolver(taxCtx);
+            Map<UUID, TaxCode> newTaxCodes = addMissingTaxCodes(invoice, taxResolver, taxCtx, invCtx);
+
+            // Compute any TAX adjustments needed due to ITEM_ADJ on taxable rows.
+            // computeTaxOrAdjustmentItemsForNewInvoice is idempotent: if getAdditionalInvoiceItems
+            // already applied a TAX adjustment during the Kill Bill adjustInvoiceItem call,
+            // currentTaxAmount will already match expectedTaxAmount and this list will be empty.
+            List<InvoiceItem> taxAdjustments = computeTaxOrAdjustmentItemsForNewInvoice(invoice, taxCtx, newTaxCodes);
+
+            if (!taxAdjustments.isEmpty()) {
+                killbillAPI.getSecurityApi().login("admin", "password");
+                try {
+                    for (InvoiceItem adj : taxAdjustments) {
+                        if (adj == null || adj.getAmount() == null) {
+                            continue;
+                        }
+                        logger.info("Applying TAX adjustment of [" + adj.getAmount()
+                                + "] linked to item [" + adj.getLinkedItemId()
+                                + "] on invoice [" + invoiceId + "]");
+                        if (isTaxItem(adj)) {
+                            getInvoiceUserApi().insertTaxItems(
+                                    invoice.getAccountId(), invoice.getInvoiceDate(),
+                                    newArrayList(adj), false, ImmutableList.of(), invCtx);
+                        } else if (adj.getAmount().compareTo(ZERO) < 0) {
+                            // Negative ITEM_ADJ = TAX reduction; insertInvoiceItemAdjustment takes positive reduction amount
+                            getInvoiceUserApi().insertInvoiceItemAdjustment(
+                                    invoice.getAccountId(), invoice.getId(), adj.getLinkedItemId(),
+                                    invoice.getInvoiceDate(), adj.getAmount().negate(),
+                                    invoice.getCurrency(), adj.getDescription(), null,
+                                    ImmutableList.of(), invCtx);
+                        } else {
+                            logger.warn("Skipping unsupported positive TAX adjustment of [" + adj.getAmount()
+                                    + "] for invoice [" + invoiceId + "] — cannot increase a committed TAX item");
+                        }
+                    }
+                } catch (Exception exc) {
+                    logger.error("Failed to apply TAX adjustments for invoice [" + invoiceId + "]", exc);
+                } finally {
+                    killbillAPI.getSecurityApi().logout();
+                }
+            }
         }
     }
 
@@ -706,7 +775,7 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
         if (tax == null) {
             return ZERO;
         }
-        return amount.multiply(tax.getRate()).setScale(cfg.getTaxAmountPrecision(), HALF_UP);
+        return amount.multiply(tax.getRate()).setScale(cfg.getTaxAmountPrecision(), CEILING);
     }
 
     /**
