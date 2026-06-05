@@ -88,9 +88,7 @@ import static java.math.BigDecimal.ZERO;
 import static java.math.RoundingMode.CEILING;
 import static org.killbill.billing.ObjectType.INVOICE;
 import static org.killbill.billing.ObjectType.INVOICE_ITEM;
-import static org.killbill.billing.notification.plugin.api.ExtBusEventType.INVOICE_ADJUSTMENT;
 import static org.killbill.billing.notification.plugin.api.ExtBusEventType.INVOICE_CREATION;
-import static org.killbill.billing.plugin.api.invoice.PluginInvoiceItem.createAdjustmentItem;
 import static org.killbill.billing.plugin.api.invoice.PluginInvoiceItem.createTaxItem;
 import static org.killbill.billing.plugin.simpletax.config.SimpleTaxConfig.DEFAULT_TAX_ITEM_DESC;
 import static org.killbill.billing.plugin.simpletax.config.http.CustomFieldService.TAX_COUNTRY_CUSTOM_FIELD_NAME;
@@ -203,7 +201,6 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
 
         ImmutableList.Builder<InvoiceItem> additionalItems = ImmutableList.builder();
         for (Invoice invoice : taxCtx.getAllInvoices()) {
-
             List<InvoiceItem> newItems;
             if (invoice.equals(newInvoice)) {
                 newItems = computeTaxOrAdjustmentItemsForNewInvoice(invoice, taxCtx, newTaxCodes);
@@ -247,7 +244,16 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
                         exc);
             }
 
-            InvoiceContext invCtx = new InvoiceContextImp.Builder<>().withAccountId(null).withTenantId(tenantId).withCreatedDate(DateTime.now()).withInvoice(newInvoice).build();
+            SimpleTaxConfig loginCfg = configHandler.getConfigurable(tenantId);
+            String loginUser = loginCfg.getCredentials().get("username");
+
+            InvoiceContext invCtx = new InvoiceContextImp.Builder<>()
+                    .withAccountId(null)
+                    .withTenantId(tenantId)
+                    .withCreatedDate(DateTime.now())
+                    .withUserName(loginUser)
+                    .withInvoice(newInvoice)
+                    .build();
 
             TaxComputationContext taxCtx = createTaxComputationContext(newInvoice, invCtx);
             TaxResolver taxResolver = instanciateTaxResolver(taxCtx);
@@ -255,7 +261,9 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
 
             // Since we're coming from the bus, we need to log-in manually
             // TODO The plugin should have its own table instead of relying on custom fields for this
-            killbillAPI.getSecurityApi().login("admin", "password");
+            killbillAPI.getSecurityApi().login(
+                    loginUser,
+                    loginCfg.getCredentials().get("password"));
 
             for (Entry<UUID, TaxCode> entry : newTaxCodes.entrySet()) {
                 UUID invoiceItemId = entry.getKey();
@@ -264,103 +272,6 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
                 persistTaxCode(taxCode, invoiceItemId, newInvoice, invCtx);
             }
 
-        } else if (INVOICE_ADJUSTMENT.equals(event.getEventType())) {
-            logger.info("INVOICE_ADJUSTMENT received for invoice [" + invoiceId + "] tenant [" + tenantId + "]");
-            try {
-                applyTaxAdjustmentsForItemAdj(invoiceId, tenantId);
-            } catch (Exception exc) {
-                logger.error("Unexpected error in tax adjustment handler for invoice [" + invoiceId + "]", exc);
-            }
-        }
-    }
-
-    private void applyTaxAdjustmentsForItemAdj(UUID invoiceId, UUID tenantId) throws Exception {
-        Invoice invoice;
-        try {
-            invoice = getInvoiceUserApi().getInvoice(invoiceId, new PluginTenantContext(null, tenantId));
-        } catch (OSGIServiceNotAvailable exc) {
-            logger.error("applyTaxAdjustmentsForItemAdj: invoice user API unavailable for invoice [" + invoiceId + "]", exc);
-            throw exc;
-        } catch (InvoiceApiException exc) {
-            logger.error("applyTaxAdjustmentsForItemAdj: cannot fetch invoice [" + invoiceId + "]", exc);
-            return;
-        }
-
-        boolean hasItemAdj = false;
-        for (InvoiceItem item : invoice.getInvoiceItems()) {
-            if (InvoiceItemType.ITEM_ADJ.equals(item.getInvoiceItemType())) {
-                hasItemAdj = true;
-                break;
-            }
-        }
-        if (!hasItemAdj) {
-            logger.debug("applyTaxAdjustmentsForItemAdj: no ITEM_ADJ on invoice [" + invoiceId + "], skipping");
-            return;
-        }
-
-        InvoiceContext invCtx = new InvoiceContextImp.Builder<>()
-                .withAccountId(invoice.getAccountId())
-                .withTenantId(tenantId)
-                .withCreatedDate(DateTime.now())
-                .withInvoice(invoice)
-                .build();
-
-        logger.info("applyTaxAdjustmentsForItemAdj: building tax context for invoice [" + invoiceId
-                + "] account [" + invoice.getAccountId() + "]");
-        TaxComputationContext taxCtx = createTaxComputationContext(invoice, invCtx);
-        TaxResolver taxResolver = instanciateTaxResolver(taxCtx);
-        Map<UUID, TaxCode> newTaxCodes = addMissingTaxCodes(invoice, taxResolver, taxCtx, invCtx);
-
-        List<InvoiceItem> taxAdjustments = computeTaxOrAdjustmentItemsForNewInvoice(invoice, taxCtx, newTaxCodes);
-        logger.info("applyTaxAdjustmentsForItemAdj: computed [" + taxAdjustments.size()
-                + "] adjustment(s) for invoice [" + invoiceId + "]");
-
-        if (taxAdjustments.isEmpty()) {
-            return;
-        }
-
-        SimpleTaxConfig cfg = taxCtx.getConfig();
-        killbillAPI.getSecurityApi().login(
-                cfg.getCredentials().get("username"),
-                cfg.getCredentials().get("password"));
-        try {
-            for (InvoiceItem adj : taxAdjustments) {
-                if (adj == null || adj.getAmount() == null) {
-                    continue;
-                }
-                logger.info("applyTaxAdjustmentsForItemAdj: applying adjustment amount=[" + adj.getAmount()
-                        + "] type=[" + adj.getInvoiceItemType()
-                        + "] linkedItem=[" + adj.getLinkedItemId()
-                        + "] on invoice [" + invoiceId + "]");
-                if (isTaxItem(adj)) {
-                    getInvoiceUserApi().insertTaxItems(
-                            invoice.getAccountId(),
-                            invoice.getInvoiceDate(),
-                            newArrayList(adj),
-                            false,
-                            ImmutableList.<PluginProperty>of(),
-                            invCtx);
-                } else if (adj.getAmount().compareTo(ZERO) < 0) {
-                    getInvoiceUserApi().insertInvoiceItemAdjustment(
-                            invoice.getAccountId(),
-                            invoice.getId(),
-                            adj.getLinkedItemId(),
-                            invoice.getInvoiceDate(),
-                            adj.getAmount().negate(),
-                            invoice.getCurrency(),
-                            adj.getDescription(),
-                            null,
-                            ImmutableList.<PluginProperty>of(),
-                            invCtx);
-                } else {
-                    logger.warn("applyTaxAdjustmentsForItemAdj: skipping positive adj amount=[" + adj.getAmount()
-                            + "] on invoice [" + invoiceId + "]");
-                }
-            }
-        } catch (Exception exc) {
-            logger.error("applyTaxAdjustmentsForItemAdj: failed to apply adjustments for invoice [" + invoiceId + "]", exc);
-        } finally {
-            killbillAPI.getSecurityApi().logout();
         }
     }
 
@@ -426,10 +337,14 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
      */
     private Set<Invoice> allInvoicesOfAccount(Account account, Invoice newInvoice, InvoiceContext invCtx) {
         ImmutableSet.Builder<Invoice> builder = ImmutableSet.builder();
-        builder.addAll(getInvoicesByAccountId(account.getId(), invCtx));
-
-        // Workaround for https://github.com/killbill/killbill/issues/265
+        // Add newInvoice first so ImmutableSet keeps it over any stale DB version.
+        // During INVOICE_ADJUSTMENT the list-by-account API may return the invoice
+        // without the ITEM_ADJ that was just committed, causing adjustedAmount to
+        // equal rawAmount and producing zero tax adjustments.
+        // Also satisfies the original workaround for kb/issues/265 (new invoice
+        // not yet in DB at the time getAdditionalInvoiceItems is called).
         builder.add(newInvoice);
+        builder.addAll(getInvoicesByAccountId(account.getId(), invCtx));
 
         return builder.build();
     }
@@ -542,6 +457,11 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
         for (CustomField field : allCustomFields) {
             if (TAX_CODES_FIELD_NAME.equals(field.getFieldName())) {
                 Invoice invoice = invoiceOfItem.get(field.getObjectId());
+                if (invoice == null) {
+                    logger.debug("taxFieldsOfInvoices: skipping custom field [{}] on item [{}] not in allInvoices",
+                            field.getId(), field.getObjectId());
+                    continue;
+                }
                 taxFieldsOfInvoice.put(invoice.getId(), field);
             }
         }
@@ -733,34 +653,14 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
 
             if (currentTaxAmount.compareTo(expectedTaxAmount) < 0) {
                 BigDecimal missingTaxAmount = expectedTaxAmount.subtract(currentTaxAmount);
-                if (relatedTaxItems.size() <= 0) {
-                    // In case a taxable item has never been taxed yet, we are
-                    // allowed to add tax to it since it belongs to a newly
-                    // created invoice.
-                    InvoiceItem newTaxItem = buildTaxItem(item, newInvoice.getInvoiceDate(), missingTaxAmount,
-                            taxItemDescription);
-                    newItems.add(newTaxItem);
-                } else {
-                    // Here we know that 'relatedTaxItems' is not empty so we
-                    // have some tax items and thus 'largestTaxItem' not to be
-                    // null.
-                    InvoiceItem largestTaxItem = ctx.byAdjustedAmount().max(relatedTaxItems);
-
-                    InvoiceItem positiveAdjItem = buildAdjustmentForTaxItem(largestTaxItem,
-                            newInvoice.getInvoiceDate(), missingTaxAmount, taxItemDescription);
-                    newItems.add(positiveAdjItem);
-                }
+                InvoiceItem newTaxItem = buildTaxItem(item, newInvoice.getInvoiceDate(), missingTaxAmount,
+                        taxItemDescription);
+                newItems.add(newTaxItem);
             } else if (currentTaxAmount.compareTo(expectedTaxAmount) > 0) {
                 BigDecimal negativeAdjAmount = expectedTaxAmount.subtract(currentTaxAmount);
-
-                // Here 'currentTaxAmount' should be > 0 (if 'expectedTaxAmount'
-                // properly is > 0), so we expect the item to have some tax
-                // items and thus 'largestTaxItem' not to be null.
-                InvoiceItem largestTaxItem = ctx.byAdjustedAmount().max(relatedTaxItems);
-
-                InvoiceItem negativeAdjItem = buildAdjustmentForTaxItem(largestTaxItem, newInvoice.getInvoiceDate(),
-                        negativeAdjAmount, taxItemDescription);
-                newItems.add(negativeAdjItem);
+                InvoiceItem negTaxItem = buildTaxItem(item, newInvoice.getInvoiceDate(), negativeAdjAmount,
+                        taxItemDescription);
+                newItems.add(negTaxItem);
             }
         }
         return newItems.build();
@@ -850,46 +750,6 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
     }
 
     /**
-     * Creates an adjustment for a tax item, or returns {@code null} if the
-     * amount is {@code null} or zero.
-     * <p>
-     * The created adjustment item will be created in the same invoice as the
-     * taxable item it relates to. But its date should be the one of the new
-     * invoice, the creation of which has triggered the adjustment.
-     * <p>
-     * If a {@code null} description is passed, then a default description is
-     * used instead.
-     *
-     * @param taxItemToAdjust
-     *            The tax item to be adjusted, which <em>must</em> be
-     *            {@linkplain #isTaxItem of a tax type}.
-     * @param date
-     *            The date at which the tax item above is adjusted. This
-     *            typically is the date of the new invoice, the creation of
-     *            which has triggered the adjustment.
-     * @param adjustmentAmount
-     *            The (optional) adjustment amount
-     * @param description
-     *            An optional description for the adjustment item to create, or
-     *            {@code null} if a default description is fine.
-     * @return An new adjustment item, or {@code null}.
-     * @throws IllegalArgumentException
-     *             if {@code taxItemToAdjust} is not {@linkplain #isTaxItem of a
-     *             tax type}.
-     */
-    private InvoiceItem buildAdjustmentForTaxItem(InvoiceItem taxItemToAdjust, LocalDate date,
-            @Nullable BigDecimal adjustmentAmount, @Nonnull String description) {
-        checkArgument(isTaxItem(taxItemToAdjust), "not a tax type: %s", taxItemToAdjust.getInvoiceItemType());
-        if ((adjustmentAmount == null) || (ZERO.compareTo(adjustmentAmount) == 0)) {
-            // This can actually not happen in our current code. We just keep it
-            // because it was taken from the API helper methods.
-            return null;
-        }
-        return createAdjustmentItem(taxItemToAdjust, taxItemToAdjust.getInvoiceId(), date, null, adjustmentAmount,
-                description);
-    }
-
-    /**
      * Compute adjustment items on existing tax items in a <em>historical</em>
      * invoice.
      * <p>
@@ -935,25 +795,11 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
 
             if (currentTaxAmount.compareTo(expectedTaxAmount) != 0) {
                 BigDecimal adjustmentAmount = expectedTaxAmount.subtract(currentTaxAmount);
-
-                if (relatedTaxItems.isEmpty()) {
-                    // Here tax != null because with relatedTaxItem == null we
-                    // necessarily have a zero currentTaxAmount, so
-                    // expectedTaxAmount is not zero and necessarily results
-                    // from a tax code
-                    InvoiceItem taxItem = buildTaxItem(item, oldInvoice.getInvoiceDate(), adjustmentAmount,
-                            tax.getTaxItemDescription());
-                    newItems.add(taxItem);
-                } else {
-                    // here we have a tax item but the tax code might have been
-                    // removed, so it could be null
-                    InvoiceItem largestTaxItem = ctx.byAdjustedAmount().max(relatedTaxItems);
-                    String taxItemDescription = tax != null ? tax.getTaxItemDescription() : largestTaxItem
-                            .getDescription();
-                    InvoiceItem adjItem = buildAdjustmentForTaxItem(largestTaxItem, oldInvoice.getInvoiceDate(),
-                            adjustmentAmount, taxItemDescription);
-                    newItems.add(adjItem);
-                }
+                String taxItemDescription = tax != null ? tax.getTaxItemDescription()
+                        : currentTaxItems.get(item.getId()).iterator().next().getDescription();
+                InvoiceItem taxItem = buildTaxItem(item, oldInvoice.getInvoiceDate(), adjustmentAmount,
+                        taxItemDescription);
+                newItems.add(taxItem);
             }
         }
         return newItems.build();
@@ -982,4 +828,5 @@ public class SimpleTaxPlugin extends PluginInvoicePluginApi implements OSGIKillb
     protected boolean isAdjustmentItem(final InvoiceItem invoiceItem) {
         return ADJUSTMENT_ITEM_TYPES.contains(invoiceItem.getInvoiceItemType());
     }
+
 }
